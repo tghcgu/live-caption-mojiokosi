@@ -30,6 +30,11 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $transcriptPath = Join-Path $OutputDirectory "caption-$timestamp.txt"
 New-Item -ItemType File -Path $transcriptPath -Force | Out-Null
 
+$stopRequestPath = Join-Path $PSScriptRoot "stop-request.flag"
+$latestTranscriptPathFile = Join-Path $PSScriptRoot "latest-transcript-path.txt"
+Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction SilentlyContinue
+Set-Content -LiteralPath $latestTranscriptPathFile -Value $transcriptPath -Encoding UTF8
+
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
@@ -45,6 +50,12 @@ public static class NativeWindowTools
 
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -143,6 +154,52 @@ function Get-NotepadWindowHandle {
     }
 
     return [IntPtr]::Zero
+}
+
+function Get-ForegroundProcessId {
+    $foregroundWindow = [NativeWindowTools]::GetForegroundWindow()
+    if ($foregroundWindow -eq [IntPtr]::Zero) {
+        return $null
+    }
+
+    [uint32]$processId = 0
+    [NativeWindowTools]::GetWindowThreadProcessId($foregroundWindow, [ref]$processId) | Out-Null
+
+    if ($processId -eq 0) {
+        return $null
+    }
+
+    return [int]$processId
+}
+
+function Test-NotepadIsForeground {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$FilePath
+    )
+
+    if ($null -eq $Process) {
+        return $false
+    }
+
+    $foregroundWindow = [NativeWindowTools]::GetForegroundWindow()
+    $targetWindow = Get-NotepadWindowHandle -Process $Process -FilePath $FilePath
+    if ($foregroundWindow -ne [IntPtr]::Zero -and $targetWindow -ne [IntPtr]::Zero -and $foregroundWindow -eq $targetWindow) {
+        return $true
+    }
+
+    $foregroundProcessId = Get-ForegroundProcessId
+    if ($null -eq $foregroundProcessId) {
+        return $false
+    }
+
+    try {
+        $Process.Refresh()
+        return $foregroundProcessId -eq $Process.Id
+    } catch {
+    }
+
+    return $false
 }
 
 function Invoke-AppActivate {
@@ -447,8 +504,17 @@ function Paste-TextToNotepad {
     param(
         [System.Diagnostics.Process]$Process,
         [string]$FilePath,
-        [string]$Text
+        [string]$Text,
+        [switch]$OnlyWhenNotepadIsForeground
     )
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return "pasted"
+    }
+
+    if ($OnlyWhenNotepadIsForeground -and -not (Test-NotepadIsForeground -Process $Process -FilePath $FilePath)) {
+        return "paused"
+    }
 
     $window = Get-NotepadWindow -Process $Process -FilePath $FilePath
     $oldClipboard = $null
@@ -463,14 +529,19 @@ function Paste-TextToNotepad {
     }
 
     if (-not (Set-ClipboardTextWithRetry -Text $Text)) {
-        return $false
+        return "failed"
     }
 
-    if (-not (Activate-NotepadForPaste -Process $Process -FilePath $FilePath -Window $window)) {
-        if ($hadClipboardText) {
-            Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
+    if ($OnlyWhenNotepadIsForeground) {
+        Focus-NotepadEditor -Window $window | Out-Null
+        Start-Sleep -Milliseconds 50
+    } else {
+        if (-not (Activate-NotepadForPaste -Process $Process -FilePath $FilePath -Window $window)) {
+            if ($hadClipboardText) {
+                Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
+            }
+            return "failed"
         }
-        return $false
     }
 
     [System.Windows.Forms.SendKeys]::SendWait("^v")
@@ -482,7 +553,7 @@ function Paste-TextToNotepad {
         Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
     }
 
-    return $true
+    return "pasted"
 }
 
 $notepad = $null
@@ -506,8 +577,25 @@ $windowMissingNoticeShown = $false
 $textMissingNoticeShown = $false
 $pasteFailureNoticeShown = $false
 $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
+$capturedText = New-Object System.Text.StringBuilder
+$pendingNotepadText = New-Object System.Text.StringBuilder
+
+function Save-CapturedText {
+    param([string]$Text)
+
+    [System.IO.File]::WriteAllText($transcriptPath, $Text, [System.Text.Encoding]::UTF8)
+}
 
 while ($true) {
+    if (Test-Path -LiteralPath $stopRequestPath) {
+        if (-not $NoPasteToNotepad) {
+            Save-CapturedText -Text $capturedText.ToString()
+        }
+
+        Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction SilentlyContinue
+        break
+    }
+
     $liveCaptionsWindow = Get-LiveCaptionsWindow
 
     if ($null -eq $liveCaptionsWindow) {
@@ -543,20 +631,38 @@ while ($true) {
     $addedText = Get-AddedText -Previous $lastSnapshot -Current $snapshot
 
     if ($addedText.Length -gt 0) {
+        $capturedText.Append($addedText) | Out-Null
+
         if ($NoPasteToNotepad) {
             [System.IO.File]::AppendAllText($transcriptPath, $addedText, [System.Text.Encoding]::UTF8)
         } else {
-            $pasted = Paste-TextToNotepad -Process $notepad -FilePath $transcriptPath -Text $addedText
-            if (-not $pasted) {
-                [System.IO.File]::AppendAllText($transcriptPath, $addedText, [System.Text.Encoding]::UTF8)
+            $pendingNotepadText.Append($addedText) | Out-Null
+            $pasteStatus = Paste-TextToNotepad `
+                -Process $notepad `
+                -FilePath $transcriptPath `
+                -Text $pendingNotepadText.ToString() `
+                -OnlyWhenNotepadIsForeground
+
+            if ($pasteStatus -eq "pasted") {
+                $pendingNotepadText.Clear() | Out-Null
+                $pasteFailureNoticeShown = $false
+            } elseif ($pasteStatus -eq "failed") {
                 if (-not $pasteFailureNoticeShown) {
-                    Write-Host "Could not find the Notepad editor, so the text is being appended to the file."
-                    Write-Host "Close this window with Ctrl + C and run start.bat again after this update."
+                    Write-Host "Could not paste to Notepad. Text is being kept in memory and will be saved on stop."
                     $pasteFailureNoticeShown = $true
                 }
-            } else {
-                $pasteFailureNoticeShown = $false
             }
+        }
+    } elseif (-not $NoPasteToNotepad -and $pendingNotepadText.Length -gt 0) {
+        $pasteStatus = Paste-TextToNotepad `
+            -Process $notepad `
+            -FilePath $transcriptPath `
+            -Text $pendingNotepadText.ToString() `
+            -OnlyWhenNotepadIsForeground
+
+        if ($pasteStatus -eq "pasted") {
+            $pendingNotepadText.Clear() | Out-Null
+            $pasteFailureNoticeShown = $false
         }
     }
 

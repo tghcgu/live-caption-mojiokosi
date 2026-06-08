@@ -1,4 +1,6 @@
 transcripts/
 .app/transcripts/
+.app/*.flag
+.app/latest-transcript-path.txt
 *.lnk
 *.log
