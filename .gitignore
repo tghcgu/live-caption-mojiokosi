@@ -1,0 +1,4 @@
+transcripts/
+.app/transcripts/
+*.lnk
+*.log

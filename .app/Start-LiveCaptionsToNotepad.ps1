@@ -1,0 +1,557 @@
+param(
+    [string]$OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) "transcripts"),
+    [int]$PollMilliseconds = 300,
+    [switch]$NoStartLiveCaptions,
+    [switch]$NoPasteToNotepad
+)
+
+$ErrorActionPreference = "Stop"
+
+$currentProcessId = $PID
+$currentScriptPath = $MyInvocation.MyCommand.Path
+$alreadyRunning = Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.ProcessId -ne $currentProcessId -and
+        $_.CommandLine -match [regex]::Escape($currentScriptPath)
+    } |
+    Select-Object -First 1
+
+if ($null -ne $alreadyRunning) {
+    exit 0
+}
+
+if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+    New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$transcriptPath = Join-Path $OutputDirectory "caption-$timestamp.txt"
+New-Item -ItemType File -Path $transcriptPath -Force | Out-Null
+
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class NativeWindowTools
+{
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    public const byte VK_LWIN = 0x5B;
+    public const byte VK_CONTROL = 0x11;
+    public const byte VK_L = 0x4C;
+    public const uint KEYEVENTF_KEYUP = 0x0002;
+}
+"@
+
+function Send-LiveCaptionsShortcut {
+    [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_LWIN, 0, 0, [UIntPtr]::Zero)
+    [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_CONTROL, 0, 0, [UIntPtr]::Zero)
+    [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_L, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
+    [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_L, 0, [NativeWindowTools]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_CONTROL, 0, [NativeWindowTools]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_LWIN, 0, [NativeWindowTools]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+}
+
+function Get-NotepadWindow {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$FilePath
+    )
+
+    $fileName = ""
+    if (-not [string]::IsNullOrWhiteSpace($FilePath)) {
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
+    }
+
+    try {
+        $Process.Refresh()
+        if ($Process.MainWindowHandle -ne [IntPtr]::Zero -and [NativeWindowTools]::IsWindow($Process.MainWindowHandle)) {
+            return [System.Windows.Automation.AutomationElement]::FromHandle($Process.MainWindowHandle)
+        }
+    } catch {
+    }
+
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($window in $windows) {
+            try {
+                $name = $window.Current.Name
+                $className = $window.Current.ClassName
+                $nativeWindowHandle = $window.Current.NativeWindowHandle
+                $processName = ""
+
+                try {
+                    $processName = (Get-Process -Id $window.Current.ProcessId -ErrorAction Stop).ProcessName
+                } catch {
+                }
+
+                $isSameProcess = ($null -ne $Process -and $window.Current.ProcessId -eq $Process.Id)
+                $looksLikeNotepad = (
+                    $processName -match "(?i)^notepad$" -or
+                    $className -match "(?i)notepad|applicationframewindow" -or
+                    $name -match "(?i)notepad" -or
+                    $name -match "\u30e1\u30e2\u5e33"
+                )
+                $looksLikeTargetFile = (
+                    -not [string]::IsNullOrWhiteSpace($fileName) -and
+                    $name.IndexOf($fileName, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                )
+
+                if ($nativeWindowHandle -ne 0 -and ($isSameProcess -or $looksLikeTargetFile -or ($looksLikeNotepad -and $looksLikeTargetFile))) {
+                    return $window
+                }
+            } catch {
+            }
+        }
+    } catch {
+    }
+
+    return $null
+}
+
+function Get-NotepadWindowHandle {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$FilePath
+    )
+
+    $window = Get-NotepadWindow -Process $Process -FilePath $FilePath
+    if ($null -eq $window) {
+        return [IntPtr]::Zero
+    }
+
+    try {
+        if ($window.Current.NativeWindowHandle -ne 0) {
+            return [IntPtr]$window.Current.NativeWindowHandle
+        }
+    } catch {
+    }
+
+    return [IntPtr]::Zero
+}
+
+function Invoke-AppActivate {
+    param([object]$Target)
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        return [bool]$shell.AppActivate($Target)
+    } catch {
+    }
+
+    return $false
+}
+
+function Activate-NotepadForPaste {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$FilePath,
+        [System.Windows.Automation.AutomationElement]$Window
+    )
+
+    $activated = $false
+
+    if ($null -ne $Window) {
+        try {
+            if ($Window.Current.NativeWindowHandle -ne 0) {
+                [NativeWindowTools]::SetForegroundWindow([IntPtr]$Window.Current.NativeWindowHandle) | Out-Null
+                $activated = $true
+            }
+        } catch {
+        }
+
+        Start-Sleep -Milliseconds 80
+        if (Focus-NotepadEditor -Window $Window) {
+            $activated = $true
+        }
+    }
+
+    if (-not $activated -and -not [string]::IsNullOrWhiteSpace($FilePath)) {
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
+        $fileStem = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
+        $activated = (Invoke-AppActivate -Target $fileName) -or (Invoke-AppActivate -Target $fileStem)
+    }
+
+    if (-not $activated -and $null -ne $Process) {
+        try {
+            $activated = Invoke-AppActivate -Target $Process.Id
+        } catch {
+        }
+    }
+
+    if (-not $activated) {
+        $localizedNotepad = -join ([char]0x30e1, [char]0x30e2, [char]0x5e33)
+        $activated = (Invoke-AppActivate -Target "Notepad") -or (Invoke-AppActivate -Target $localizedNotepad)
+    }
+
+    if ($activated) {
+        Start-Sleep -Milliseconds 120
+    }
+
+    return $activated
+}
+
+function Focus-NotepadEditor {
+    param([System.Windows.Automation.AutomationElement]$Window)
+
+    if ($null -eq $Window) {
+        return $false
+    }
+
+    $controlTypes = @(
+        [System.Windows.Automation.ControlType]::Document,
+        [System.Windows.Automation.ControlType]::Edit
+    )
+
+    foreach ($controlType in $controlTypes) {
+        try {
+            $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                $controlType
+            )
+            $editor = $Window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+            if ($null -ne $editor) {
+                $editor.SetFocus()
+                return $true
+            }
+        } catch {
+        }
+    }
+
+    try {
+        $Window.SetFocus()
+        return $true
+    } catch {
+    }
+
+    return $false
+}
+
+function Test-UiNoise {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $true
+    }
+
+    $clean = ($Text -replace "\s+", " ").Trim()
+    $noisePatterns = @(
+        "^(Live captions|Live Captions|\u30e9\u30a4\u30d6\s*\u30ad\u30e3\u30d7\u30b7\u30e7\u30f3)$",
+        "^(Settings|Caption settings|Close|Minimize|Maximize|Restore|More options)$",
+        "^(\u8a2d\u5b9a|\u9589\u3058\u308b|\u6700\u5c0f\u5316|\u6700\u5927\u5316|\u5143\u306b\u623b\u3059|\u305d\u306e\u4ed6\u306e\u30aa\u30d7\u30b7\u30e7\u30f3)$",
+        "^(Ready to caption|No audio detected|Listening|Microphone)$",
+        "^(\u30ad\u30e3\u30d7\u30b7\u30e7\u30f3\u306e\u6e96\u5099\u304c\u3067\u304d\u307e\u3057\u305f|\u97f3\u58f0\u304c\u691c\u51fa\u3055\u308c\u307e\u305b\u3093|\u805e\u304d\u53d6\u308a\u4e2d|\u30de\u30a4\u30af)$"
+    )
+
+    foreach ($pattern in $noisePatterns) {
+        if ($clean -match $pattern) {
+            return $true
+        }
+    }
+
+    $notepadUiPatterns = @(
+        "\.txt\b",
+        "Windows\s*\(CRLF\)",
+        "\bUTF-8\b",
+        "^\s*(Text|\u30c6\u30ad\u30b9\u30c8|Zoom|\u30ba\u30fc\u30e0)\s*$",
+        "^(\u884c|Line)\s*\d+",
+        "^(\u5217|Column)\s*\d+",
+        "^(\u30bf\u30d6\u3092\u9589\u3058\u308b|Close tab)"
+    )
+
+    foreach ($pattern in $notepadUiPatterns) {
+        if ($clean -match $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Normalize-CaptionText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($Text -replace "`r`n|`r|`n", "`n").Split("`n")) {
+        $trimmed = $line.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            $lines.Add($trimmed)
+        }
+    }
+
+    return ($lines -join "`r`n")
+}
+
+function Get-ElementTextItems {
+    param(
+        [System.Windows.Automation.AutomationElement]$Element,
+        [System.Windows.Automation.ControlType]$ControlType
+    )
+
+    $items = New-Object System.Collections.Generic.List[string]
+    $condition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        $ControlType
+    )
+
+    try {
+        $elements = $Element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        foreach ($child in $elements) {
+            try {
+                $text = Normalize-CaptionText $child.Current.Name
+                if (-not (Test-UiNoise $text)) {
+                    if ($items.Count -eq 0 -or $items[$items.Count - 1] -ne $text) {
+                        $items.Add($text)
+                    }
+                }
+            } catch {
+            }
+        }
+    } catch {
+    }
+
+    return $items
+}
+
+function Get-LiveCaptionsWindow {
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($window in $windows) {
+            try {
+                $name = $window.Current.Name
+                $className = $window.Current.ClassName
+                $processName = ""
+
+                try {
+                    $processName = (Get-Process -Id $window.Current.ProcessId -ErrorAction Stop).ProcessName
+                } catch {
+                }
+
+                $blockedProcess = $processName -match "(?i)^(notepad|cmd|powershell|pwsh|windowsterminal|openconsole)$"
+                if ($blockedProcess) {
+                    continue
+                }
+
+                $looksLikeOutputFile = $name -match "(?i)(livecaptions|caption)-\d{8}-\d{6}\.txt"
+                if ($looksLikeOutputFile) {
+                    continue
+                }
+
+                $processIsLiveCaptions = $processName -match "(?i)^livecaptions$"
+                $titleIsLiveCaptions = (
+                    $name -match "^(?i:live\s*captions)$" -or
+                    $name -match "^\s*\u30e9\u30a4\u30d6\s*\u30ad\u30e3\u30d7\u30b7\u30e7\u30f3\s*$"
+                )
+                $classLooksUseful = $className -match "(?i)(livecaptions|xaml|corewindow|applicationframewindow)"
+
+                if ($processIsLiveCaptions -or ($titleIsLiveCaptions -and $classLooksUseful)) {
+                    return $window
+                }
+            } catch {
+            }
+        }
+    } catch {
+    }
+
+    return $null
+}
+
+function Get-LiveCaptionSnapshot {
+    param([System.Windows.Automation.AutomationElement]$Window)
+
+    $textItems = Get-ElementTextItems -Element $Window -ControlType ([System.Windows.Automation.ControlType]::Text)
+
+    if ($textItems.Count -eq 0) {
+        $textItems = Get-ElementTextItems -Element $Window -ControlType ([System.Windows.Automation.ControlType]::Document)
+    }
+
+    if ($textItems.Count -eq 0) {
+        return ""
+    }
+
+    return (($textItems | Select-Object -Unique) -join "`r`n")
+}
+
+function Get-AddedText {
+    param(
+        [string]$Previous,
+        [string]$Current
+    )
+
+    if ([string]::IsNullOrEmpty($Current)) {
+        return ""
+    }
+
+    if ([string]::IsNullOrEmpty($Previous)) {
+        return $Current
+    }
+
+    if ($Current -eq $Previous) {
+        return ""
+    }
+
+    if ($Current.StartsWith($Previous)) {
+        return $Current.Substring($Previous.Length)
+    }
+
+    if ($Previous.Contains($Current)) {
+        return ""
+    }
+
+    $max = [Math]::Min($Previous.Length, $Current.Length)
+    for ($length = $max; $length -gt 0; $length--) {
+        if ($Previous.Substring($Previous.Length - $length) -eq $Current.Substring(0, $length)) {
+            return $Current.Substring($length)
+        }
+    }
+
+    return "`r`n$Current"
+}
+
+function Set-ClipboardTextWithRetry {
+    param([string]$Text)
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($Text)
+            return $true
+        } catch {
+            Start-Sleep -Milliseconds 80
+        }
+    }
+
+    return $false
+}
+
+function Paste-TextToNotepad {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$FilePath,
+        [string]$Text
+    )
+
+    $window = Get-NotepadWindow -Process $Process -FilePath $FilePath
+    $oldClipboard = $null
+    $hadClipboardText = $false
+
+    try {
+        $hadClipboardText = [System.Windows.Forms.Clipboard]::ContainsText()
+        if ($hadClipboardText) {
+            $oldClipboard = [System.Windows.Forms.Clipboard]::GetText()
+        }
+    } catch {
+    }
+
+    if (-not (Set-ClipboardTextWithRetry -Text $Text)) {
+        return $false
+    }
+
+    if (-not (Activate-NotepadForPaste -Process $Process -FilePath $FilePath -Window $window)) {
+        if ($hadClipboardText) {
+            Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
+        }
+        return $false
+    }
+
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 50
+    [System.Windows.Forms.SendKeys]::SendWait("^s")
+
+    if ($hadClipboardText) {
+        Start-Sleep -Milliseconds 50
+        Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
+    }
+
+    return $true
+}
+
+$notepad = $null
+if (-not $NoPasteToNotepad) {
+    $notepad = Start-Process -FilePath "notepad.exe" -ArgumentList "`"$transcriptPath`"" -PassThru
+    Start-Sleep -Milliseconds 1000
+}
+
+if (-not $NoStartLiveCaptions -and $null -eq (Get-LiveCaptionsWindow)) {
+    Send-LiveCaptionsShortcut
+}
+
+Write-Host ""
+Write-Host "Live Captions to Notepad is running."
+Write-Host "Output file: $transcriptPath"
+Write-Host "Press Ctrl + C in this window to stop."
+Write-Host ""
+
+$lastSnapshot = ""
+$windowMissingNoticeShown = $false
+$textMissingNoticeShown = $false
+$pasteFailureNoticeShown = $false
+
+while ($true) {
+    $liveCaptionsWindow = Get-LiveCaptionsWindow
+
+    if ($null -eq $liveCaptionsWindow) {
+        if (-not $windowMissingNoticeShown) {
+            Write-Host "Waiting for the Windows Live Captions window..."
+            Write-Host "If it did not open, press Win + Ctrl + L."
+            $windowMissingNoticeShown = $true
+        }
+
+        Start-Sleep -Milliseconds $PollMilliseconds
+        continue
+    }
+
+    $windowMissingNoticeShown = $false
+    $snapshot = Get-LiveCaptionSnapshot -Window $liveCaptionsWindow
+
+    if ([string]::IsNullOrWhiteSpace($snapshot)) {
+        if (-not $textMissingNoticeShown) {
+            Write-Host "Live Captions was found, but no readable caption text is available yet."
+            $textMissingNoticeShown = $true
+        }
+
+        Start-Sleep -Milliseconds $PollMilliseconds
+        continue
+    }
+
+    $textMissingNoticeShown = $false
+    $addedText = Get-AddedText -Previous $lastSnapshot -Current $snapshot
+
+    if ($addedText.Length -gt 0) {
+        if ($NoPasteToNotepad) {
+            [System.IO.File]::AppendAllText($transcriptPath, $addedText, [System.Text.Encoding]::UTF8)
+        } else {
+            $pasted = Paste-TextToNotepad -Process $notepad -FilePath $transcriptPath -Text $addedText
+            if (-not $pasted) {
+                [System.IO.File]::AppendAllText($transcriptPath, $addedText, [System.Text.Encoding]::UTF8)
+                if (-not $pasteFailureNoticeShown) {
+                    Write-Host "Could not find the Notepad editor, so the text is being appended to the file."
+                    Write-Host "Close this window with Ctrl + C and run start.bat again after this update."
+                    $pasteFailureNoticeShown = $true
+                }
+            } else {
+                $pasteFailureNoticeShown = $false
+            }
+        }
+    }
+
+    $lastSnapshot = $snapshot
+    Start-Sleep -Milliseconds $PollMilliseconds
+}
