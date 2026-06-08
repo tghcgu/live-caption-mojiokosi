@@ -9,15 +9,17 @@ $ErrorActionPreference = "Stop"
 
 $currentProcessId = $PID
 $currentScriptPath = $MyInvocation.MyCommand.Path
-$alreadyRunning = Get-CimInstance Win32_Process |
+$existingProcesses = Get-CimInstance Win32_Process |
     Where-Object {
         $_.ProcessId -ne $currentProcessId -and
         $_.CommandLine -match [regex]::Escape($currentScriptPath)
-    } |
-    Select-Object -First 1
+    }
 
-if ($null -ne $alreadyRunning) {
-    exit 0
+foreach ($process in $existingProcesses) {
+    try {
+        Stop-Process -Id $process.ProcessId -Force
+    } catch {
+    }
 }
 
 if (-not (Test-Path -LiteralPath $OutputDirectory)) {
@@ -503,6 +505,7 @@ $lastSnapshot = ""
 $windowMissingNoticeShown = $false
 $textMissingNoticeShown = $false
 $pasteFailureNoticeShown = $false
+$lastLiveCaptionsStartAttempt = [DateTime]::MinValue
 
 while ($true) {
     $liveCaptionsWindow = Get-LiveCaptionsWindow
@@ -512,6 +515,11 @@ while ($true) {
             Write-Host "Waiting for the Windows Live Captions window..."
             Write-Host "If it did not open, press Win + Ctrl + L."
             $windowMissingNoticeShown = $true
+        }
+
+        if (-not $NoStartLiveCaptions -and ((Get-Date) - $lastLiveCaptionsStartAttempt).TotalSeconds -ge 5) {
+            Send-LiveCaptionsShortcut
+            $lastLiveCaptionsStartAttempt = Get-Date
         }
 
         Start-Sleep -Milliseconds $PollMilliseconds
