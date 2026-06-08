@@ -485,6 +485,168 @@ function Get-AddedText {
     return "`r`n$Current"
 }
 
+function Get-LevenshteinDistance {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if ($null -eq $Left) {
+        $Left = ""
+    }
+    if ($null -eq $Right) {
+        $Right = ""
+    }
+
+    $leftLength = $Left.Length
+    $rightLength = $Right.Length
+
+    if ($leftLength -eq 0) {
+        return $rightLength
+    }
+    if ($rightLength -eq 0) {
+        return $leftLength
+    }
+
+    $previous = New-Object int[] ($rightLength + 1)
+    $current = New-Object int[] ($rightLength + 1)
+
+    for ($j = 0; $j -le $rightLength; $j++) {
+        $previous[$j] = $j
+    }
+
+    for ($i = 1; $i -le $leftLength; $i++) {
+        $current[0] = $i
+
+        for ($j = 1; $j -le $rightLength; $j++) {
+            $cost = 1
+            if ($Left[$i - 1] -eq $Right[$j - 1]) {
+                $cost = 0
+            }
+
+            $deleteCost = $previous[$j] + 1
+            $insertCost = $current[$j - 1] + 1
+            $replaceCost = $previous[$j - 1] + $cost
+            $current[$j] = [Math]::Min([Math]::Min($deleteCost, $insertCost), $replaceCost)
+        }
+
+        $swap = $previous
+        $previous = $current
+        $current = $swap
+    }
+
+    return $previous[$rightLength]
+}
+
+function Get-ComparisonText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    return (($Text -replace "\s+", "") -replace "[、。，．,.]", "")
+}
+
+function Test-SimilarText {
+    param(
+        [string]$Left,
+        [string]$Right,
+        [double]$MaxDistanceRatio = 0.35
+    )
+
+    $leftComparison = Get-ComparisonText $Left
+    $rightComparison = Get-ComparisonText $Right
+
+    if ([string]::IsNullOrEmpty($leftComparison) -or [string]::IsNullOrEmpty($rightComparison)) {
+        return $false
+    }
+
+    $maxLength = [Math]::Max($leftComparison.Length, $rightComparison.Length)
+    if ($maxLength -eq 0) {
+        return $true
+    }
+
+    $distance = Get-LevenshteinDistance -Left $leftComparison -Right $rightComparison
+    return (($distance / $maxLength) -le $MaxDistanceRatio)
+}
+
+function Get-FuzzyOverlapLength {
+    param(
+        [string]$Existing,
+        [string]$Snapshot
+    )
+
+    $maxLength = [Math]::Min($Existing.Length, $Snapshot.Length)
+    if ($maxLength -lt 20) {
+        return 0
+    }
+
+    for ($length = $maxLength; $length -ge 20; $length -= 5) {
+        $existingTail = $Existing.Substring($Existing.Length - $length)
+        $snapshotHead = $Snapshot.Substring(0, $length)
+
+        if ($existingTail -eq $snapshotHead) {
+            return $length
+        }
+
+        $sampleLength = [Math]::Min(220, $length)
+        $tailSample = $existingTail.Substring($existingTail.Length - $sampleLength)
+        $headSample = $snapshotHead.Substring(0, $sampleLength)
+
+        if (Test-SimilarText -Left $tailSample -Right $headSample -MaxDistanceRatio 0.22) {
+            return $length
+        }
+    }
+
+    return 0
+}
+
+function Merge-CaptionText {
+    param(
+        [string]$Existing,
+        [string]$Snapshot
+    )
+
+    $current = Normalize-CaptionText $Snapshot
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        return $Existing
+    }
+
+    if ([string]::IsNullOrEmpty($Existing)) {
+        return $current
+    }
+
+    if ($current -eq $Existing) {
+        return $Existing
+    }
+
+    if ($current.StartsWith($Existing)) {
+        return $current
+    }
+
+    if ($Existing.Contains($current)) {
+        return $Existing
+    }
+
+    $existingStartLength = [Math]::Min(260, $Existing.Length)
+    $currentStartLength = [Math]::Min(260, $current.Length)
+    $existingStart = $Existing.Substring(0, $existingStartLength)
+    $currentStart = $current.Substring(0, $currentStartLength)
+
+    if ($current.Length -ge [int]($Existing.Length * 0.65) -and
+        (Test-SimilarText -Left $existingStart -Right $currentStart -MaxDistanceRatio 0.32)) {
+        return $current
+    }
+
+    $overlapLength = Get-FuzzyOverlapLength -Existing $Existing -Snapshot $current
+    if ($overlapLength -gt 0) {
+        return $Existing + $current.Substring($overlapLength)
+    }
+
+    return $Existing + "`r`n" + $current
+}
+
 function Set-ClipboardTextWithRetry {
     param([string]$Text)
 
@@ -556,6 +718,53 @@ function Paste-TextToNotepad {
     return "pasted"
 }
 
+function Sync-TextToNotepad {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$FilePath,
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return "pasted"
+    }
+
+    if (-not (Test-NotepadIsForeground -Process $Process -FilePath $FilePath)) {
+        return "paused"
+    }
+
+    $window = Get-NotepadWindow -Process $Process -FilePath $FilePath
+    $oldClipboard = $null
+    $hadClipboardText = $false
+
+    try {
+        $hadClipboardText = [System.Windows.Forms.Clipboard]::ContainsText()
+        if ($hadClipboardText) {
+            $oldClipboard = [System.Windows.Forms.Clipboard]::GetText()
+        }
+    } catch {
+    }
+
+    if (-not (Set-ClipboardTextWithRetry -Text $Text)) {
+        return "failed"
+    }
+
+    Focus-NotepadEditor -Window $window | Out-Null
+    Start-Sleep -Milliseconds 50
+    [System.Windows.Forms.SendKeys]::SendWait("^a")
+    Start-Sleep -Milliseconds 40
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 50
+    [System.Windows.Forms.SendKeys]::SendWait("^s")
+
+    if ($hadClipboardText) {
+        Start-Sleep -Milliseconds 50
+        Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
+    }
+
+    return "pasted"
+}
+
 $notepad = $null
 if (-not $NoPasteToNotepad) {
     $notepad = Start-Process -FilePath "notepad.exe" -ArgumentList "`"$transcriptPath`"" -PassThru
@@ -577,8 +786,8 @@ $windowMissingNoticeShown = $false
 $textMissingNoticeShown = $false
 $pasteFailureNoticeShown = $false
 $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
-$capturedText = New-Object System.Text.StringBuilder
-$pendingNotepadText = New-Object System.Text.StringBuilder
+$capturedText = ""
+$lastSyncedNotepadText = ""
 
 function Save-CapturedText {
     param([string]$Text)
@@ -588,9 +797,7 @@ function Save-CapturedText {
 
 while ($true) {
     if (Test-Path -LiteralPath $stopRequestPath) {
-        if (-not $NoPasteToNotepad) {
-            Save-CapturedText -Text $capturedText.ToString()
-        }
+        Save-CapturedText -Text $capturedText
 
         Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction SilentlyContinue
         break
@@ -628,41 +835,31 @@ while ($true) {
     }
 
     $textMissingNoticeShown = $false
-    $addedText = Get-AddedText -Previous $lastSnapshot -Current $snapshot
+    $mergedText = Merge-CaptionText -Existing $capturedText -Snapshot $snapshot
+    $textChanged = ($mergedText -ne $capturedText)
 
-    if ($addedText.Length -gt 0) {
-        $capturedText.Append($addedText) | Out-Null
+    if ($textChanged) {
+        $capturedText = $mergedText
 
         if ($NoPasteToNotepad) {
-            [System.IO.File]::AppendAllText($transcriptPath, $addedText, [System.Text.Encoding]::UTF8)
-        } else {
-            $pendingNotepadText.Append($addedText) | Out-Null
-            $pasteStatus = Paste-TextToNotepad `
-                -Process $notepad `
-                -FilePath $transcriptPath `
-                -Text $pendingNotepadText.ToString() `
-                -OnlyWhenNotepadIsForeground
-
-            if ($pasteStatus -eq "pasted") {
-                $pendingNotepadText.Clear() | Out-Null
-                $pasteFailureNoticeShown = $false
-            } elseif ($pasteStatus -eq "failed") {
-                if (-not $pasteFailureNoticeShown) {
-                    Write-Host "Could not paste to Notepad. Text is being kept in memory and will be saved on stop."
-                    $pasteFailureNoticeShown = $true
-                }
-            }
+            Save-CapturedText -Text $capturedText
         }
-    } elseif (-not $NoPasteToNotepad -and $pendingNotepadText.Length -gt 0) {
-        $pasteStatus = Paste-TextToNotepad `
+    }
+
+    if (-not $NoPasteToNotepad -and $capturedText -ne $lastSyncedNotepadText) {
+        $pasteStatus = Sync-TextToNotepad `
             -Process $notepad `
             -FilePath $transcriptPath `
-            -Text $pendingNotepadText.ToString() `
-            -OnlyWhenNotepadIsForeground
+            -Text $capturedText
 
         if ($pasteStatus -eq "pasted") {
-            $pendingNotepadText.Clear() | Out-Null
+            $lastSyncedNotepadText = $capturedText
             $pasteFailureNoticeShown = $false
+        } elseif ($pasteStatus -eq "failed") {
+            if (-not $pasteFailureNoticeShown) {
+                Write-Host "Could not sync Notepad. Text is being kept in memory and will be saved on stop."
+                $pasteFailureNoticeShown = $true
+            }
         }
     }
 
