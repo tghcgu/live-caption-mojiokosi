@@ -312,7 +312,8 @@ function Test-UiNoise {
         "^(Settings|Caption settings|Close|Minimize|Maximize|Restore|More options)$",
         "^(\u8a2d\u5b9a|\u9589\u3058\u308b|\u6700\u5c0f\u5316|\u6700\u5927\u5316|\u5143\u306b\u623b\u3059|\u305d\u306e\u4ed6\u306e\u30aa\u30d7\u30b7\u30e7\u30f3)$",
         "^(Ready to caption|No audio detected|Listening|Microphone)$",
-        "^(\u30ad\u30e3\u30d7\u30b7\u30e7\u30f3\u306e\u6e96\u5099\u304c\u3067\u304d\u307e\u3057\u305f|\u97f3\u58f0\u304c\u691c\u51fa\u3055\u308c\u307e\u305b\u3093|\u805e\u304d\u53d6\u308a\u4e2d|\u30de\u30a4\u30af)$"
+        "^(\u30ad\u30e3\u30d7\u30b7\u30e7\u30f3\u306e\u6e96\u5099\u304c\u3067\u304d\u307e\u3057\u305f|\u97f3\u58f0\u304c\u691c\u51fa\u3055\u308c\u307e\u305b\u3093|\u805e\u304d\u53d6\u308a\u4e2d|\u30de\u30a4\u30af)$",
+        "^\S+\s*\([^)]+\)\s*\u306e\s*\u30e9\u30a4\u30d6\s*\u30ad\u30e3\u30d7\u30b7\u30e7\u30f3\u3092\u8868\u793a\u3059\u308b\u6e96\u5099\u304c\u3067\u304d\u307e\u3057\u305f$"
     )
 
     foreach ($pattern in $noisePatterns) {
@@ -389,6 +390,90 @@ function Get-ElementTextItems {
     return $items
 }
 
+function Test-PrefixRevision {
+    param(
+        [string]$Shorter,
+        [string]$Longer
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Shorter) -or [string]::IsNullOrWhiteSpace($Longer)) {
+        return $false
+    }
+
+    $shortComparison = Get-ComparisonText $Shorter
+    $longComparison = Get-ComparisonText $Longer
+
+    if ($shortComparison.Length -eq 0 -or $longComparison.Length -eq 0) {
+        return $false
+    }
+
+    if ($shortComparison.Length -ge $longComparison.Length) {
+        return $false
+    }
+
+    if ($longComparison.StartsWith($shortComparison)) {
+        return $true
+    }
+
+    if ($shortComparison.Length -lt 8) {
+        return $false
+    }
+
+    $prefixLength = [Math]::Min($shortComparison.Length, $longComparison.Length)
+    $longPrefix = $longComparison.Substring(0, $prefixLength)
+    return (Test-SimilarText -Left $shortComparison -Right $longPrefix -MaxDistanceRatio 0.18)
+}
+
+function Compress-CaptionItems {
+    param([System.Collections.Generic.List[string]]$Items)
+
+    $compressed = New-Object System.Collections.Generic.List[string]
+
+    foreach ($item in $Items) {
+        $text = Normalize-CaptionText $item
+        if (Test-UiNoise $text) {
+            continue
+        }
+
+        $lines = @()
+        foreach ($line in ($text -replace "`r`n|`r|`n", "`n").Split("`n")) {
+            $trimmed = $line.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($trimmed) -and -not (Test-UiNoise $trimmed)) {
+                $lines += $trimmed
+            }
+        }
+
+        foreach ($line in $lines) {
+            $skipLine = $false
+
+            for ($i = $compressed.Count - 1; $i -ge 0; $i--) {
+                $existing = $compressed[$i]
+
+                if ($existing -eq $line) {
+                    $skipLine = $true
+                    break
+                }
+
+                if (Test-PrefixRevision -Shorter $existing -Longer $line) {
+                    $compressed.RemoveAt($i)
+                    continue
+                }
+
+                if (Test-PrefixRevision -Shorter $line -Longer $existing) {
+                    $skipLine = $true
+                    break
+                }
+            }
+
+            if (-not $skipLine) {
+                $compressed.Add($line)
+            }
+        }
+    }
+
+    return $compressed
+}
+
 function Get-LiveCaptionsWindow {
     try {
         $root = [System.Windows.Automation.AutomationElement]::RootElement
@@ -446,7 +531,13 @@ function Get-LiveCaptionSnapshot {
         return ""
     }
 
-    return (($textItems | Select-Object -Unique) -join "`r`n")
+    $captionItems = Compress-CaptionItems -Items $textItems
+
+    if ($captionItems.Count -eq 0) {
+        return ""
+    }
+
+    return ($captionItems -join "`r`n")
 }
 
 function Get-AddedText {
