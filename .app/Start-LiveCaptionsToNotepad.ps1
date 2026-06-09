@@ -61,12 +61,20 @@ public static class NativeWindowTools
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
+
     public const byte VK_LWIN = 0x5B;
     public const byte VK_CONTROL = 0x11;
     public const byte VK_L = 0x4C;
+    public const int VK_LBUTTON = 0x01;
     public const uint KEYEVENTF_KEYUP = 0x0002;
 }
 "@
+
+function Test-LeftMousePressedSinceLastCheck {
+    return ((([int][NativeWindowTools]::GetAsyncKeyState([NativeWindowTools]::VK_LBUTTON)) -band 0x0001) -ne 0)
+}
 
 function Send-LiveCaptionsShortcut {
     [NativeWindowTools]::keybd_event([NativeWindowTools]::VK_LWIN, 0, 0, [UIntPtr]::Zero)
@@ -1067,15 +1075,17 @@ while ($true) {
     }
 
     $notepadIsForeground = $false
+    $notepadClickRequested = $false
     if (-not $NoPasteToNotepad) {
         $notepadIsForeground = Test-NotepadIsForeground -Process $notepad -FilePath $transcriptPath
+        $notepadClickRequested = $notepadIsForeground -and (Test-LeftMousePressedSinceLastCheck)
     }
 
     $shouldSyncNotepad = (
         -not $NoPasteToNotepad -and
         $notepadText -ne $lastSyncedNotepadText -and
         $notepadIsForeground -and
-        ($ContinuousNotepadSync -or -not $lastNotepadWasForeground)
+        ($ContinuousNotepadSync -or -not $lastNotepadWasForeground -or $notepadClickRequested)
     )
 
     if ($shouldSyncNotepad) {
