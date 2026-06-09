@@ -2,7 +2,8 @@ param(
     [string]$OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) "transcripts"),
     [int]$PollMilliseconds = 300,
     [switch]$NoStartLiveCaptions,
-    [switch]$NoPasteToNotepad
+    [switch]$NoPasteToNotepad,
+    [switch]$ContinuousNotepadSync
 )
 
 $ErrorActionPreference = "Stop"
@@ -655,18 +656,28 @@ function Get-ComparisonText {
         return ""
     }
 
-    return (($Text -replace "\s+", "") -replace "[、。，．,.]", "")
+    return (($Text -replace "\s+", "") -replace "[\u3001\u3002\uff0c\uff0e,\.]", "")
 }
 
 function Test-StableCaptionLine {
     param([string]$Text)
 
     $comparison = Get-ComparisonText $Text
-    if ($comparison.Length -ge 8) {
+    if ($comparison.Length -ge 12) {
         return $true
     }
 
-    return ($Text -match "[。！？.!?]$")
+    return ($Text.Trim() -match "[\u3002\uff0e\.\!\?\uff01\uff1f]$")
+}
+
+function Test-CompleteCaptionLine {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return ($Text.Trim() -match "[\u3002\uff0e\.\!\?\uff01\uff1f]$")
 }
 
 function Get-TranscriptText {
@@ -771,6 +782,46 @@ function Merge-CaptionText {
 
     if ($Existing.Contains($current)) {
         return $Existing
+    }
+
+    $existingLines = @(
+        ($Existing -replace "`r`n|`r|`n", "`n").Split("`n") |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $currentLines = @(
+        ($current -replace "`r`n|`r|`n", "`n").Split("`n") |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($existingLines.Count -gt 0 -and $currentLines.Count -eq 1) {
+        $lastLineIndex = $existingLines.Count - 1
+        $lastLine = $existingLines[$lastLineIndex]
+        $currentLine = $currentLines[0]
+
+        if ($lastLine -eq $currentLine) {
+            return $Existing
+        }
+
+        if (Test-PrefixRevision -Shorter $currentLine -Longer $lastLine) {
+            return $Existing
+        }
+
+        $lastComparison = Get-ComparisonText $lastLine
+        $currentComparison = Get-ComparisonText $currentLine
+        $looksLikeRevision = (Test-PrefixRevision -Shorter $lastLine -Longer $currentLine)
+
+        if (-not $looksLikeRevision -and
+            $lastComparison.Length -ge 8 -and
+            $currentComparison.Length -ge [int]($lastComparison.Length * 0.7)) {
+            $looksLikeRevision = Test-SimilarText -Left $lastLine -Right $currentLine -MaxDistanceRatio 0.28
+        }
+
+        if ($looksLikeRevision) {
+            $existingLines[$lastLineIndex] = $currentLine
+            return ($existingLines -join "`r`n")
+        }
     }
 
     $existingStartLength = [Math]::Min(260, $Existing.Length)
@@ -933,6 +984,7 @@ $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
 $capturedText = ""
 $pendingCaptionText = ""
 $lastSyncedNotepadText = ""
+$lastNotepadWasForeground = $false
 
 function Save-CapturedText {
     param([string]$Text)
@@ -984,7 +1036,15 @@ while ($true) {
     $snapshotLines = Split-CaptionLines $snapshot
     $textChanged = $false
 
-    foreach ($line in $snapshotLines) {
+    for ($lineIndex = 0; $lineIndex -lt $snapshotLines.Count; $lineIndex++) {
+        $line = $snapshotLines[$lineIndex]
+        $isLastSnapshotLine = ($lineIndex -eq ($snapshotLines.Count - 1))
+
+        if ($isLastSnapshotLine -and -not (Test-CompleteCaptionLine $line)) {
+            $pendingCaptionText = $line
+            continue
+        }
+
         if (-not (Test-StableCaptionLine $line)) {
             $pendingCaptionText = $line
             continue
@@ -1005,7 +1065,19 @@ while ($true) {
         Save-CapturedText -Text $outputText
     }
 
-    if (-not $NoPasteToNotepad -and $outputText -ne $lastSyncedNotepadText) {
+    $notepadIsForeground = $false
+    if (-not $NoPasteToNotepad) {
+        $notepadIsForeground = Test-NotepadIsForeground -Process $notepad -FilePath $transcriptPath
+    }
+
+    $shouldSyncNotepad = (
+        -not $NoPasteToNotepad -and
+        $outputText -ne $lastSyncedNotepadText -and
+        $notepadIsForeground -and
+        ($ContinuousNotepadSync -or -not $lastNotepadWasForeground)
+    )
+
+    if ($shouldSyncNotepad) {
         $pasteStatus = Sync-TextToNotepad `
             -Process $notepad `
             -FilePath $transcriptPath `
@@ -1021,6 +1093,8 @@ while ($true) {
             }
         }
     }
+
+    $lastNotepadWasForeground = $notepadIsForeground
 
     $lastSnapshot = $snapshot
     Start-Sleep -Milliseconds $PollMilliseconds
