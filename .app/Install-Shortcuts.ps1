@@ -64,7 +64,7 @@ function New-AppShortcut {
     $shortcut.Save()
 }
 
-$notepadArgs = "-WindowStyle Hidden -STA -NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
+$notepadArgs = "-WindowStyle Hidden -STA -NoProfile -ExecutionPolicy Bypass -File `"$startScript`" -NoPasteToNotepad"
 $stopArgs = "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$stopScript`""
 
 foreach ($dir in $shortcutDirs) {
