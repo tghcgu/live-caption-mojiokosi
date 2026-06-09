@@ -1060,6 +1060,7 @@ while ($true) {
     }
 
     $outputText = Get-TranscriptText -Captured $capturedText -Pending $pendingCaptionText
+    $notepadText = Get-TranscriptText -Captured $capturedText -Pending $pendingCaptionText -IncludePending
 
     if ($NoPasteToNotepad -and $textChanged) {
         Save-CapturedText -Text $outputText
@@ -1072,7 +1073,7 @@ while ($true) {
 
     $shouldSyncNotepad = (
         -not $NoPasteToNotepad -and
-        $outputText -ne $lastSyncedNotepadText -and
+        $notepadText -ne $lastSyncedNotepadText -and
         $notepadIsForeground -and
         ($ContinuousNotepadSync -or -not $lastNotepadWasForeground)
     )
@@ -1081,10 +1082,10 @@ while ($true) {
         $pasteStatus = Sync-TextToNotepad `
             -Process $notepad `
             -FilePath $transcriptPath `
-            -Text $outputText
+            -Text $notepadText
 
         if ($pasteStatus -eq "pasted") {
-            $lastSyncedNotepadText = $outputText
+            $lastSyncedNotepadText = $notepadText
             $pasteFailureNoticeShown = $false
         } elseif ($pasteStatus -eq "failed") {
             if (-not $pasteFailureNoticeShown) {
