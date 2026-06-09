@@ -359,6 +359,25 @@ function Normalize-CaptionText {
     return ($lines -join "`r`n")
 }
 
+function Split-CaptionLines {
+    param([string]$Text)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $lines
+    }
+
+    foreach ($line in ($Text -replace "`r`n|`r|`n", "`n").Split("`n")) {
+        $trimmed = $line.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and -not (Test-UiNoise $trimmed)) {
+            $lines.Add($trimmed)
+        }
+    }
+
+    return $lines
+}
+
 function Get-ElementTextItems {
     param(
         [System.Windows.Automation.AutomationElement]$Element,
@@ -639,6 +658,40 @@ function Get-ComparisonText {
     return (($Text -replace "\s+", "") -replace "[、。，．,.]", "")
 }
 
+function Test-StableCaptionLine {
+    param([string]$Text)
+
+    $comparison = Get-ComparisonText $Text
+    if ($comparison.Length -ge 8) {
+        return $true
+    }
+
+    return ($Text -match "[。！？.!?]$")
+}
+
+function Get-TranscriptText {
+    param(
+        [string]$Captured,
+        [string]$Pending,
+        [switch]$IncludePending
+    )
+
+    $text = ""
+    if ($null -ne $Captured) {
+        $text = $Captured
+    }
+
+    if ($IncludePending -and -not [string]::IsNullOrWhiteSpace($Pending)) {
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return $Pending
+        }
+
+        return $text + "`r`n" + $Pending
+    }
+
+    return $text
+}
+
 function Test-SimilarText {
     param(
         [string]$Left,
@@ -878,6 +931,7 @@ $textMissingNoticeShown = $false
 $pasteFailureNoticeShown = $false
 $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
 $capturedText = ""
+$pendingCaptionText = ""
 $lastSyncedNotepadText = ""
 
 function Save-CapturedText {
@@ -888,7 +942,8 @@ function Save-CapturedText {
 
 while ($true) {
     if (Test-Path -LiteralPath $stopRequestPath) {
-        Save-CapturedText -Text $capturedText
+        $finalText = Get-TranscriptText -Captured $capturedText -Pending $pendingCaptionText -IncludePending
+        Save-CapturedText -Text $finalText
 
         Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction SilentlyContinue
         break
@@ -926,25 +981,38 @@ while ($true) {
     }
 
     $textMissingNoticeShown = $false
-    $mergedText = Merge-CaptionText -Existing $capturedText -Snapshot $snapshot
-    $textChanged = ($mergedText -ne $capturedText)
+    $snapshotLines = Split-CaptionLines $snapshot
+    $textChanged = $false
 
-    if ($textChanged) {
-        $capturedText = $mergedText
+    foreach ($line in $snapshotLines) {
+        if (-not (Test-StableCaptionLine $line)) {
+            $pendingCaptionText = $line
+            continue
+        }
 
-        if ($NoPasteToNotepad) {
-            Save-CapturedText -Text $capturedText
+        $pendingCaptionText = ""
+        $mergedText = Merge-CaptionText -Existing $capturedText -Snapshot $line
+
+        if ($mergedText -ne $capturedText) {
+            $capturedText = $mergedText
+            $textChanged = $true
         }
     }
 
-    if (-not $NoPasteToNotepad -and $capturedText -ne $lastSyncedNotepadText) {
+    $outputText = Get-TranscriptText -Captured $capturedText -Pending $pendingCaptionText
+
+    if ($NoPasteToNotepad -and $textChanged) {
+        Save-CapturedText -Text $outputText
+    }
+
+    if (-not $NoPasteToNotepad -and $outputText -ne $lastSyncedNotepadText) {
         $pasteStatus = Sync-TextToNotepad `
             -Process $notepad `
             -FilePath $transcriptPath `
-            -Text $capturedText
+            -Text $outputText
 
         if ($pasteStatus -eq "pasted") {
-            $lastSyncedNotepadText = $capturedText
+            $lastSyncedNotepadText = $outputText
             $pasteFailureNoticeShown = $false
         } elseif ($pasteStatus -eq "failed") {
             if (-not $pasteFailureNoticeShown) {
