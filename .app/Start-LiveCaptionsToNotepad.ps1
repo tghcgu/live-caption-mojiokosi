@@ -1,6 +1,6 @@
 param(
     [string]$OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) "transcripts"),
-    [int]$PollMilliseconds = 300,
+    [int]$PollMilliseconds = 200,
     [switch]$NoStartLiveCaptions,
     [switch]$NoPasteToNotepad,
     [switch]$ContinuousNotepadSync
@@ -688,6 +688,17 @@ function Test-CompleteCaptionLine {
     return ($Text.Trim() -match "[\u3002\uff0e\.\!\?\uff01\uff1f]$")
 }
 
+function Test-RescuableCaptionLine {
+    param([string]$Text)
+
+    $comparison = Get-ComparisonText $Text
+    if ($comparison.Length -ge 8) {
+        return $true
+    }
+
+    return (Test-CompleteCaptionLine $Text)
+}
+
 function Get-TranscriptText {
     param(
         [string]$Captured,
@@ -1000,6 +1011,108 @@ function Save-CapturedText {
     [System.IO.File]::WriteAllText($transcriptPath, $Text, [System.Text.Encoding]::UTF8)
 }
 
+function Add-CapturedCaptionLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $false
+    }
+
+    $mergedText = Merge-CaptionText -Existing $script:capturedText -Snapshot $Line
+
+    if ($mergedText -ne $script:capturedText) {
+        $script:capturedText = $mergedText
+        return $true
+    }
+
+    return $false
+}
+
+function Test-PendingCaptionSupersededByLine {
+    param(
+        [string]$Pending,
+        [string]$Line
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Pending) -or [string]::IsNullOrWhiteSpace($Line)) {
+        return $false
+    }
+
+    if ($Pending -eq $Line) {
+        return $true
+    }
+
+    if (Test-PrefixRevision -Shorter $Pending -Longer $Line) {
+        return $true
+    }
+
+    $pendingComparison = Get-ComparisonText $Pending
+    $lineComparison = Get-ComparisonText $Line
+
+    if ($pendingComparison.Length -lt 8 -or $lineComparison.Length -lt [int]($pendingComparison.Length * 0.6)) {
+        return $false
+    }
+
+    return (Test-SimilarText -Left $Pending -Right $Line -MaxDistanceRatio 0.34)
+}
+
+function Flush-PendingCaptionText {
+    if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
+        return $false
+    }
+
+    if (-not (Test-RescuableCaptionLine $script:pendingCaptionText)) {
+        $script:pendingCaptionText = ""
+        return $false
+    }
+
+    $changed = Add-CapturedCaptionLine -Line $script:pendingCaptionText
+    $script:pendingCaptionText = ""
+    return $changed
+}
+
+function Set-PendingCaptionTextSafely {
+    param([string]$Text)
+
+    $newPending = Normalize-CaptionText $Text
+    if ([string]::IsNullOrWhiteSpace($newPending)) {
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
+        $script:pendingCaptionText = $newPending
+        return $false
+    }
+
+    if (Test-PendingCaptionSupersededByLine -Pending $script:pendingCaptionText -Line $newPending) {
+        $script:pendingCaptionText = $newPending
+        return $false
+    }
+
+    if (Test-PendingCaptionSupersededByLine -Pending $newPending -Line $script:pendingCaptionText) {
+        return $false
+    }
+
+    $changed = Flush-PendingCaptionText
+    $script:pendingCaptionText = $newPending
+    return $changed
+}
+
+function Resolve-PendingCaptionBeforeCapturedLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
+        return $false
+    }
+
+    if (Test-PendingCaptionSupersededByLine -Pending $script:pendingCaptionText -Line $Line) {
+        $script:pendingCaptionText = ""
+        return $false
+    }
+
+    return (Flush-PendingCaptionText)
+}
+
 while ($true) {
     if (Test-Path -LiteralPath $stopRequestPath) {
         $finalText = Get-TranscriptText -Captured $capturedText -Pending $pendingCaptionText -IncludePending
@@ -1049,20 +1162,24 @@ while ($true) {
         $isLastSnapshotLine = ($lineIndex -eq ($snapshotLines.Count - 1))
 
         if ($isLastSnapshotLine -and -not (Test-CompleteCaptionLine $line)) {
-            $pendingCaptionText = $line
+            if (Set-PendingCaptionTextSafely -Text $line) {
+                $textChanged = $true
+            }
             continue
         }
 
         if (-not (Test-StableCaptionLine $line)) {
-            $pendingCaptionText = $line
+            if (Set-PendingCaptionTextSafely -Text $line) {
+                $textChanged = $true
+            }
             continue
         }
 
-        $pendingCaptionText = ""
-        $mergedText = Merge-CaptionText -Existing $capturedText -Snapshot $line
+        if (Resolve-PendingCaptionBeforeCapturedLine -Line $line) {
+            $textChanged = $true
+        }
 
-        if ($mergedText -ne $capturedText) {
-            $capturedText = $mergedText
+        if (Add-CapturedCaptionLine -Line $line) {
             $textChanged = $true
         }
     }
