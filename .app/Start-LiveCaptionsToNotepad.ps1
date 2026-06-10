@@ -1002,6 +1002,8 @@ $pasteFailureNoticeShown = $false
 $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
 $capturedText = ""
 $pendingCaptionText = ""
+$pendingCaptionFirstSeenAt = $null
+$PendingRescueMilliseconds = 1000
 $lastSyncedNotepadText = ""
 $lastNotepadWasForeground = $false
 
@@ -1056,18 +1058,62 @@ function Test-PendingCaptionSupersededByLine {
     return (Test-SimilarText -Left $Pending -Right $Line -MaxDistanceRatio 0.34)
 }
 
+function Clear-PendingCaptionText {
+    $script:pendingCaptionText = ""
+    $script:pendingCaptionFirstSeenAt = $null
+}
+
+function Set-PendingCaptionTextRaw {
+    param(
+        [string]$Text,
+        [switch]$KeepFirstSeen
+    )
+
+    $newPending = Normalize-CaptionText $Text
+    if ([string]::IsNullOrWhiteSpace($newPending)) {
+        Clear-PendingCaptionText
+        return
+    }
+
+    if (-not $KeepFirstSeen -or $null -eq $script:pendingCaptionFirstSeenAt -or [string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
+        $script:pendingCaptionFirstSeenAt = Get-Date
+    }
+
+    $script:pendingCaptionText = $newPending
+}
+
+function Test-PendingCaptionReadyToRescue {
+    if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
+        return $false
+    }
+
+    if (Test-CompleteCaptionLine $script:pendingCaptionText) {
+        return $true
+    }
+
+    if (-not (Test-RescuableCaptionLine $script:pendingCaptionText)) {
+        return $false
+    }
+
+    if ($null -eq $script:pendingCaptionFirstSeenAt) {
+        return $false
+    }
+
+    return (((Get-Date) - $script:pendingCaptionFirstSeenAt).TotalMilliseconds -ge $script:PendingRescueMilliseconds)
+}
+
 function Flush-PendingCaptionText {
     if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
         return $false
     }
 
-    if (-not (Test-RescuableCaptionLine $script:pendingCaptionText)) {
-        $script:pendingCaptionText = ""
+    if (-not (Test-PendingCaptionReadyToRescue)) {
+        Clear-PendingCaptionText
         return $false
     }
 
     $changed = Add-CapturedCaptionLine -Line $script:pendingCaptionText
-    $script:pendingCaptionText = ""
+    Clear-PendingCaptionText
     return $changed
 }
 
@@ -1080,12 +1126,12 @@ function Set-PendingCaptionTextSafely {
     }
 
     if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
-        $script:pendingCaptionText = $newPending
+        Set-PendingCaptionTextRaw -Text $newPending
         return $false
     }
 
     if (Test-PendingCaptionSupersededByLine -Pending $script:pendingCaptionText -Line $newPending) {
-        $script:pendingCaptionText = $newPending
+        Set-PendingCaptionTextRaw -Text $newPending -KeepFirstSeen
         return $false
     }
 
@@ -1094,7 +1140,7 @@ function Set-PendingCaptionTextSafely {
     }
 
     $changed = Flush-PendingCaptionText
-    $script:pendingCaptionText = $newPending
+    Set-PendingCaptionTextRaw -Text $newPending
     return $changed
 }
 
@@ -1106,7 +1152,7 @@ function Resolve-PendingCaptionBeforeCapturedLine {
     }
 
     if (Test-PendingCaptionSupersededByLine -Pending $script:pendingCaptionText -Line $Line) {
-        $script:pendingCaptionText = ""
+        Clear-PendingCaptionText
         return $false
     }
 
