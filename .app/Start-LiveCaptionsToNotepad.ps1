@@ -590,17 +590,6 @@ function Get-ComparisonText {
     return (($Text -replace "\s+", "") -replace "[\u3001\u3002\uff0c\uff0e,\.]", "")
 }
 
-function Test-StableCaptionLine {
-    param([string]$Text)
-
-    $comparison = Get-ComparisonText $Text
-    if ($comparison.Length -ge 12) {
-        return $true
-    }
-
-    return ($Text.Trim() -match "[\u3002\uff0e\.\!\?\uff01\uff1f]$")
-}
-
 function Test-CompleteCaptionLine {
     param([string]$Text)
 
@@ -666,122 +655,6 @@ function Test-SimilarText {
 
     $distance = Get-LevenshteinDistance -Left $leftComparison -Right $rightComparison
     return (($distance / $maxLength) -le $MaxDistanceRatio)
-}
-
-function Get-FuzzyOverlapLength {
-    param(
-        [string]$Existing,
-        [string]$Snapshot
-    )
-
-    $maxLength = [Math]::Min($Existing.Length, $Snapshot.Length)
-    if ($maxLength -lt 20) {
-        return 0
-    }
-
-    for ($length = $maxLength; $length -ge 20; $length -= 5) {
-        $existingTail = $Existing.Substring($Existing.Length - $length)
-        $snapshotHead = $Snapshot.Substring(0, $length)
-
-        if ($existingTail -eq $snapshotHead) {
-            return $length
-        }
-
-        $sampleLength = [Math]::Min(220, $length)
-        $tailSample = $existingTail.Substring($existingTail.Length - $sampleLength)
-        $headSample = $snapshotHead.Substring(0, $sampleLength)
-
-        if (Test-SimilarText -Left $tailSample -Right $headSample -MaxDistanceRatio 0.22) {
-            return $length
-        }
-    }
-
-    return 0
-}
-
-function Merge-CaptionText {
-    param(
-        [string]$Existing,
-        [string]$Snapshot
-    )
-
-    $current = Normalize-CaptionText $Snapshot
-    if ([string]::IsNullOrWhiteSpace($current)) {
-        return $Existing
-    }
-
-    if ([string]::IsNullOrEmpty($Existing)) {
-        return $current
-    }
-
-    if ($current -eq $Existing) {
-        return $Existing
-    }
-
-    if ($current.StartsWith($Existing)) {
-        return $current
-    }
-
-    if ($Existing.Contains($current)) {
-        return $Existing
-    }
-
-    $existingLines = @(
-        ($Existing -replace "`r`n|`r|`n", "`n").Split("`n") |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
-    $currentLines = @(
-        ($current -replace "`r`n|`r|`n", "`n").Split("`n") |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
-
-    if ($existingLines.Count -gt 0 -and $currentLines.Count -eq 1) {
-        $lastLineIndex = $existingLines.Count - 1
-        $lastLine = $existingLines[$lastLineIndex]
-        $currentLine = $currentLines[0]
-
-        if ($lastLine -eq $currentLine) {
-            return $Existing
-        }
-
-        if (Test-PrefixRevision -Shorter $currentLine -Longer $lastLine) {
-            return $Existing
-        }
-
-        $lastComparison = Get-ComparisonText $lastLine
-        $currentComparison = Get-ComparisonText $currentLine
-        $looksLikeRevision = (Test-PrefixRevision -Shorter $lastLine -Longer $currentLine)
-
-        if (-not $looksLikeRevision -and
-            $lastComparison.Length -ge 8 -and
-            $currentComparison.Length -ge [int]($lastComparison.Length * 0.7)) {
-            $looksLikeRevision = Test-SimilarText -Left $lastLine -Right $currentLine -MaxDistanceRatio 0.28
-        }
-
-        if ($looksLikeRevision) {
-            $existingLines[$lastLineIndex] = $currentLine
-            return ($existingLines -join "`r`n")
-        }
-    }
-
-    $existingStartLength = [Math]::Min(260, $Existing.Length)
-    $currentStartLength = [Math]::Min(260, $current.Length)
-    $existingStart = $Existing.Substring(0, $existingStartLength)
-    $currentStart = $current.Substring(0, $currentStartLength)
-
-    if ($current.Length -ge [int]($Existing.Length * 0.65) -and
-        (Test-SimilarText -Left $existingStart -Right $currentStart -MaxDistanceRatio 0.32)) {
-        return $current
-    }
-
-    $overlapLength = Get-FuzzyOverlapLength -Existing $Existing -Snapshot $current
-    if ($overlapLength -gt 0) {
-        return $Existing + $current.Substring($overlapLength)
-    }
-
-    return $Existing + "`r`n" + $current
 }
 
 function Set-ClipboardTextWithRetry {
@@ -867,9 +740,11 @@ $textMissingNoticeShown = $false
 $pasteFailureNoticeShown = $false
 $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
 $capturedText = ""
+$capturedLines = New-Object System.Collections.Generic.List[string]
 $pendingCaptionText = ""
 $pendingCaptionFirstSeenAt = $null
 $PendingRescueMilliseconds = 1000
+$CapturedLineDedupWindow = 40
 $lastSyncedNotepadText = ""
 $lastNotepadWasForeground = $false
 
@@ -882,18 +757,54 @@ function Save-CapturedText {
 function Add-CapturedCaptionLine {
     param([string]$Line)
 
-    if ([string]::IsNullOrWhiteSpace($Line)) {
+    $newLine = Normalize-CaptionText $Line
+    if ([string]::IsNullOrWhiteSpace($newLine)) {
         return $false
     }
 
-    $mergedText = Merge-CaptionText -Existing $script:capturedText -Snapshot $Line
+    $count = $script:capturedLines.Count
 
-    if ($mergedText -ne $script:capturedText) {
-        $script:capturedText = $mergedText
-        return $true
+    if ($count -gt 0) {
+        $lastIndex = $count - 1
+        $lastLine = $script:capturedLines[$lastIndex]
+
+        if ($lastLine -eq $newLine) {
+            return $false
+        }
+
+        if (Test-PrefixRevision -Shorter $newLine -Longer $lastLine) {
+            return $false
+        }
+
+        $looksLikeRevision = Test-PrefixRevision -Shorter $lastLine -Longer $newLine
+
+        if (-not $looksLikeRevision) {
+            $lastComparison = Get-ComparisonText $lastLine
+            $newComparison = Get-ComparisonText $newLine
+
+            if ($lastComparison.Length -ge 8 -and
+                $newComparison.Length -ge [int]($lastComparison.Length * 0.7)) {
+                $looksLikeRevision = Test-SimilarText -Left $lastLine -Right $newLine -MaxDistanceRatio 0.28
+            }
+        }
+
+        if ($looksLikeRevision) {
+            $script:capturedLines[$lastIndex] = $newLine
+            $script:capturedText = ($script:capturedLines -join "`r`n")
+            return $true
+        }
+
+        $dedupStart = [Math]::Max(0, $count - $script:CapturedLineDedupWindow)
+        for ($i = $lastIndex; $i -ge $dedupStart; $i--) {
+            if ($script:capturedLines[$i] -eq $newLine) {
+                return $false
+            }
+        }
     }
 
-    return $false
+    $script:capturedLines.Add($newLine)
+    $script:capturedText = ($script:capturedLines -join "`r`n")
+    return $true
 }
 
 function Test-PendingCaptionSupersededByLine {
@@ -1074,13 +985,6 @@ while ($true) {
         $isLastSnapshotLine = ($lineIndex -eq ($snapshotLines.Count - 1))
 
         if ($isLastSnapshotLine -and -not (Test-CompleteCaptionLine $line)) {
-            if (Set-PendingCaptionTextSafely -Text $line) {
-                $textChanged = $true
-            }
-            continue
-        }
-
-        if (-not (Test-StableCaptionLine $line)) {
             if (Set-PendingCaptionTextSafely -Text $line) {
                 $textChanged = $true
             }
