@@ -10,16 +10,37 @@ $ErrorActionPreference = "Stop"
 
 $currentProcessId = $PID
 $currentScriptPath = $MyInvocation.MyCommand.Path
-$existingProcesses = Get-CimInstance Win32_Process |
+$startScriptPattern = [regex]::Escape($currentScriptPath)
+$stopRequestPath = Join-Path $PSScriptRoot "stop-request.flag"
+
+$existingProcesses = @(Get-CimInstance Win32_Process |
     Where-Object {
         $_.ProcessId -ne $currentProcessId -and
-        $_.CommandLine -match [regex]::Escape($currentScriptPath)
+        $_.CommandLine -match "(?i)-File\s+`"?$startScriptPattern`"?"
+    })
+
+if ($existingProcesses.Count -gt 0) {
+    Set-Content -LiteralPath $stopRequestPath -Value (Get-Date).ToString("o") -Encoding ASCII
+
+    for ($attempt = 1; $attempt -le 15; $attempt++) {
+        Start-Sleep -Milliseconds 200
+
+        $existingProcesses = @(Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.ProcessId -ne $currentProcessId -and
+                $_.CommandLine -match "(?i)-File\s+`"?$startScriptPattern`"?"
+            })
+
+        if ($existingProcesses.Count -eq 0) {
+            break
+        }
     }
 
-foreach ($process in $existingProcesses) {
-    try {
-        Stop-Process -Id $process.ProcessId -Force
-    } catch {
+    foreach ($process in $existingProcesses) {
+        try {
+            Stop-Process -Id $process.ProcessId -Force
+        } catch {
+        }
     }
 }
 
@@ -31,7 +52,6 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $transcriptPath = Join-Path $OutputDirectory "caption-$timestamp.txt"
 New-Item -ItemType File -Path $transcriptPath -Force | Out-Null
 
-$stopRequestPath = Join-Path $PSScriptRoot "stop-request.flag"
 $latestTranscriptPathFile = Join-Path $PSScriptRoot "latest-transcript-path.txt"
 Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction SilentlyContinue
 Set-Content -LiteralPath $latestTranscriptPathFile -Value $transcriptPath -Encoding UTF8
