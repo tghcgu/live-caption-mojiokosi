@@ -211,67 +211,6 @@ function Test-NotepadIsForeground {
     return $false
 }
 
-function Invoke-AppActivate {
-    param([object]$Target)
-
-    try {
-        $shell = New-Object -ComObject WScript.Shell
-        return [bool]$shell.AppActivate($Target)
-    } catch {
-    }
-
-    return $false
-}
-
-function Activate-NotepadForPaste {
-    param(
-        [System.Diagnostics.Process]$Process,
-        [string]$FilePath,
-        [System.Windows.Automation.AutomationElement]$Window
-    )
-
-    $activated = $false
-
-    if ($null -ne $Window) {
-        try {
-            if ($Window.Current.NativeWindowHandle -ne 0) {
-                [NativeWindowTools]::SetForegroundWindow([IntPtr]$Window.Current.NativeWindowHandle) | Out-Null
-                $activated = $true
-            }
-        } catch {
-        }
-
-        Start-Sleep -Milliseconds 80
-        if (Focus-NotepadEditor -Window $Window) {
-            $activated = $true
-        }
-    }
-
-    if (-not $activated -and -not [string]::IsNullOrWhiteSpace($FilePath)) {
-        $fileName = [System.IO.Path]::GetFileName($FilePath)
-        $fileStem = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
-        $activated = (Invoke-AppActivate -Target $fileName) -or (Invoke-AppActivate -Target $fileStem)
-    }
-
-    if (-not $activated -and $null -ne $Process) {
-        try {
-            $activated = Invoke-AppActivate -Target $Process.Id
-        } catch {
-        }
-    }
-
-    if (-not $activated) {
-        $localizedNotepad = -join ([char]0x30e1, [char]0x30e2, [char]0x5e33)
-        $activated = (Invoke-AppActivate -Target "Notepad") -or (Invoke-AppActivate -Target $localizedNotepad)
-    }
-
-    if ($activated) {
-        Start-Sleep -Milliseconds 120
-    }
-
-    return $activated
-}
-
 function Focus-NotepadEditor {
     param([System.Windows.Automation.AutomationElement]$Window)
 
@@ -568,42 +507,6 @@ function Get-LiveCaptionSnapshot {
     return ($captionItems -join "`r`n")
 }
 
-function Get-AddedText {
-    param(
-        [string]$Previous,
-        [string]$Current
-    )
-
-    if ([string]::IsNullOrEmpty($Current)) {
-        return ""
-    }
-
-    if ([string]::IsNullOrEmpty($Previous)) {
-        return $Current
-    }
-
-    if ($Current -eq $Previous) {
-        return ""
-    }
-
-    if ($Current.StartsWith($Previous)) {
-        return $Current.Substring($Previous.Length)
-    }
-
-    if ($Previous.Contains($Current)) {
-        return ""
-    }
-
-    $max = [Math]::Min($Previous.Length, $Current.Length)
-    for ($length = $max; $length -gt 0; $length--) {
-        if ($Previous.Substring($Previous.Length - $length) -eq $Current.Substring(0, $length)) {
-            return $Current.Substring($length)
-        }
-    }
-
-    return "`r`n$Current"
-}
-
 function Get-LevenshteinDistance {
     param(
         [string]$Left,
@@ -876,62 +779,6 @@ function Set-ClipboardTextWithRetry {
     return $false
 }
 
-function Paste-TextToNotepad {
-    param(
-        [System.Diagnostics.Process]$Process,
-        [string]$FilePath,
-        [string]$Text,
-        [switch]$OnlyWhenNotepadIsForeground
-    )
-
-    if ([string]::IsNullOrEmpty($Text)) {
-        return "pasted"
-    }
-
-    if ($OnlyWhenNotepadIsForeground -and -not (Test-NotepadIsForeground -Process $Process -FilePath $FilePath)) {
-        return "paused"
-    }
-
-    $window = Get-NotepadWindow -Process $Process -FilePath $FilePath
-    $oldClipboard = $null
-    $hadClipboardText = $false
-
-    try {
-        $hadClipboardText = [System.Windows.Forms.Clipboard]::ContainsText()
-        if ($hadClipboardText) {
-            $oldClipboard = [System.Windows.Forms.Clipboard]::GetText()
-        }
-    } catch {
-    }
-
-    if (-not (Set-ClipboardTextWithRetry -Text $Text)) {
-        return "failed"
-    }
-
-    if ($OnlyWhenNotepadIsForeground) {
-        Focus-NotepadEditor -Window $window | Out-Null
-        Start-Sleep -Milliseconds 50
-    } else {
-        if (-not (Activate-NotepadForPaste -Process $Process -FilePath $FilePath -Window $window)) {
-            if ($hadClipboardText) {
-                Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
-            }
-            return "failed"
-        }
-    }
-
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 50
-    [System.Windows.Forms.SendKeys]::SendWait("^s")
-
-    if ($hadClipboardText) {
-        Start-Sleep -Milliseconds 50
-        Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
-    }
-
-    return "pasted"
-}
-
 function Sync-TextToNotepad {
     param(
         [System.Diagnostics.Process]$Process,
@@ -995,7 +842,6 @@ Write-Host "Output file: $transcriptPath"
 Write-Host "Press Ctrl + C in this window to stop."
 Write-Host ""
 
-$lastSnapshot = ""
 $windowMissingNoticeShown = $false
 $textMissingNoticeShown = $false
 $pasteFailureNoticeShown = $false
@@ -1270,6 +1116,5 @@ while ($true) {
 
     $lastNotepadWasForeground = $notepadIsForeground
 
-    $lastSnapshot = $snapshot
     Start-Sleep -Milliseconds $PollMilliseconds
 }
