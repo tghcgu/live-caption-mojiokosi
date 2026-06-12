@@ -433,22 +433,13 @@ function Compress-CaptionItems {
         foreach ($line in $lines) {
             $skipLine = $false
 
-            for ($i = $compressed.Count - 1; $i -ge 0; $i--) {
-                $existing = $compressed[$i]
+            if ($compressed.Count -gt 0) {
+                $previous = $compressed[$compressed.Count - 1]
 
-                if ($existing -eq $line) {
+                if ($previous -eq $line -or (Test-PrefixRevision -Shorter $line -Longer $previous)) {
                     $skipLine = $true
-                    break
-                }
-
-                if (Test-PrefixRevision -Shorter $existing -Longer $line) {
-                    $compressed.RemoveAt($i)
-                    continue
-                }
-
-                if (Test-PrefixRevision -Shorter $line -Longer $existing) {
-                    $skipLine = $true
-                    break
+                } elseif (Test-PrefixRevision -Shorter $previous -Longer $line) {
+                    $compressed.RemoveAt($compressed.Count - 1)
                 }
             }
 
@@ -741,6 +732,7 @@ $pasteFailureNoticeShown = $false
 $lastLiveCaptionsStartAttempt = [DateTime]::MinValue
 $capturedText = ""
 $capturedLines = New-Object System.Collections.Generic.List[string]
+$capturedMatchCursor = -1
 $pendingCaptionText = ""
 $pendingCaptionFirstSeenAt = $null
 $PendingRescueMilliseconds = 1000
@@ -766,13 +758,20 @@ function Add-CapturedCaptionLine {
 
     if ($count -gt 0) {
         $lastIndex = $count - 1
-        $lastLine = $script:capturedLines[$lastIndex]
 
-        if ($lastLine -eq $newLine) {
-            return $false
+        $dedupStart = [Math]::Max(0, $count - $script:CapturedLineDedupWindow)
+        $searchStart = [Math]::Max($dedupStart, $script:capturedMatchCursor + 1)
+        for ($i = $searchStart; $i -le $lastIndex; $i++) {
+            if ($script:capturedLines[$i] -eq $newLine) {
+                $script:capturedMatchCursor = $i
+                return $false
+            }
         }
 
+        $lastLine = $script:capturedLines[$lastIndex]
+
         if (Test-PrefixRevision -Shorter $newLine -Longer $lastLine) {
+            $script:capturedMatchCursor = $lastIndex
             return $false
         }
 
@@ -790,19 +789,14 @@ function Add-CapturedCaptionLine {
 
         if ($looksLikeRevision) {
             $script:capturedLines[$lastIndex] = $newLine
+            $script:capturedMatchCursor = $lastIndex
             $script:capturedText = ($script:capturedLines -join "`r`n")
             return $true
-        }
-
-        $dedupStart = [Math]::Max(0, $count - $script:CapturedLineDedupWindow)
-        for ($i = $lastIndex; $i -ge $dedupStart; $i--) {
-            if ($script:capturedLines[$i] -eq $newLine) {
-                return $false
-            }
         }
     }
 
     $script:capturedLines.Add($newLine)
+    $script:capturedMatchCursor = $script:capturedLines.Count - 1
     $script:capturedText = ($script:capturedLines -join "`r`n")
     return $true
 }
@@ -902,6 +896,13 @@ function Set-PendingCaptionTextSafely {
         return $false
     }
 
+    if ($script:capturedLines.Count -gt 0) {
+        $lastCaptured = $script:capturedLines[$script:capturedLines.Count - 1]
+        if ($lastCaptured -eq $newPending -or (Test-PrefixRevision -Shorter $newPending -Longer $lastCaptured)) {
+            return $false
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
         Set-PendingCaptionTextRaw -Text $newPending
         return $false
@@ -979,6 +980,7 @@ while ($true) {
     $textMissingNoticeShown = $false
     $snapshotLines = Split-CaptionLines $snapshot
     $textChanged = $false
+    $capturedMatchCursor = -1
 
     for ($lineIndex = 0; $lineIndex -lt $snapshotLines.Count; $lineIndex++) {
         $line = $snapshotLines[$lineIndex]
