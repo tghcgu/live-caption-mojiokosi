@@ -746,6 +746,38 @@ function Save-CapturedText {
     [System.IO.File]::WriteAllText($transcriptPath, $Text, [System.Text.Encoding]::UTF8)
 }
 
+function Test-LikelySameCapturedLine {
+    param(
+        [string]$Existing,
+        [string]$New
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Existing) -or [string]::IsNullOrWhiteSpace($New)) {
+        return $false
+    }
+
+    if ($Existing -eq $New) {
+        return $true
+    }
+
+    $existingComparison = Get-ComparisonText $Existing
+    $newComparison = Get-ComparisonText $New
+    $shorterLength = [Math]::Min($existingComparison.Length, $newComparison.Length)
+    $longerLength = [Math]::Max($existingComparison.Length, $newComparison.Length)
+
+    if ($shorterLength -ge 8 -and
+        ((Test-PrefixRevision -Shorter $Existing -Longer $New) -or
+        (Test-PrefixRevision -Shorter $New -Longer $Existing))) {
+        return $true
+    }
+
+    if ($shorterLength -lt 16 -or $shorterLength -lt [int]($longerLength * 0.75)) {
+        return $false
+    }
+
+    return (Test-SimilarText -Left $Existing -Right $New -MaxDistanceRatio 0.2)
+}
+
 function Add-CapturedCaptionLine {
     param([string]$Line)
 
@@ -762,7 +794,7 @@ function Add-CapturedCaptionLine {
         $dedupStart = [Math]::Max(0, $count - $script:CapturedLineDedupWindow)
         $searchStart = [Math]::Max($dedupStart, $script:capturedMatchCursor + 1)
         for ($i = $searchStart; $i -le $lastIndex; $i++) {
-            if ($script:capturedLines[$i] -eq $newLine) {
+            if (Test-LikelySameCapturedLine -Existing $script:capturedLines[$i] -New $newLine) {
                 $script:capturedMatchCursor = $i
                 return $false
             }
