@@ -696,11 +696,19 @@ function Sync-TextToNotepad {
 
     Focus-NotepadEditor -Window $window | Out-Null
     Start-Sleep -Milliseconds 50
-    [System.Windows.Forms.SendKeys]::SendWait("^a")
-    Start-Sleep -Milliseconds 40
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 50
-    [System.Windows.Forms.SendKeys]::SendWait("^s")
+
+    try {
+        [System.Windows.Forms.SendKeys]::SendWait("^a")
+        Start-Sleep -Milliseconds 40
+        [System.Windows.Forms.SendKeys]::SendWait("^v")
+        Start-Sleep -Milliseconds 50
+        [System.Windows.Forms.SendKeys]::SendWait("^s")
+    } catch {
+        if ($hadClipboardText) {
+            Set-ClipboardTextWithRetry -Text $oldClipboard | Out-Null
+        }
+        return "failed"
+    }
 
     if ($hadClipboardText) {
         Start-Sleep -Milliseconds 50
@@ -716,7 +724,9 @@ if (-not $NoPasteToNotepad) {
     Start-Sleep -Milliseconds 1000
 }
 
-if (-not $NoStartLiveCaptions -and $null -eq (Get-LiveCaptionsWindow)) {
+if (-not $NoStartLiveCaptions -and
+    $null -eq (Get-Process -Name "LiveCaptions" -ErrorAction SilentlyContinue) -and
+    $null -eq (Get-LiveCaptionsWindow)) {
     Send-LiveCaptionsShortcut
 }
 
@@ -743,7 +753,21 @@ $lastNotepadWasForeground = $false
 function Save-CapturedText {
     param([string]$Text)
 
-    [System.IO.File]::WriteAllText($transcriptPath, $Text, [System.Text.Encoding]::UTF8)
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            [System.IO.File]::WriteAllText($transcriptPath, $Text, [System.Text.Encoding]::UTF8)
+            return
+        } catch {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+
+    $fallbackPath = Join-Path $env:TEMP ("caption-rescue-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".txt")
+    try {
+        [System.IO.File]::WriteAllText($fallbackPath, $Text, [System.Text.Encoding]::UTF8)
+        Write-Host "Could not write $transcriptPath. Saved to $fallbackPath instead."
+    } catch {
+    }
 }
 
 function Test-LikelySameCapturedLine {
@@ -794,8 +818,18 @@ function Add-CapturedCaptionLine {
         $dedupStart = [Math]::Max(0, $count - $script:CapturedLineDedupWindow)
         $searchStart = [Math]::Max($dedupStart, $script:capturedMatchCursor + 1)
         for ($i = $searchStart; $i -le $lastIndex; $i++) {
-            if (Test-LikelySameCapturedLine -Existing $script:capturedLines[$i] -New $newLine) {
+            $existing = $script:capturedLines[$i]
+
+            if (Test-LikelySameCapturedLine -Existing $existing -New $newLine) {
                 $script:capturedMatchCursor = $i
+
+                if ($existing -ne $newLine -and
+                    (Get-ComparisonText $newLine).Length -ge (Get-ComparisonText $existing).Length) {
+                    $script:capturedLines[$i] = $newLine
+                    $script:capturedText = ($script:capturedLines -join "`r`n")
+                    return $true
+                }
+
                 return $false
             }
         }
@@ -969,6 +1003,18 @@ function Resolve-PendingCaptionBeforeCapturedLine {
     return (Flush-PendingCaptionText)
 }
 
+function Clear-PendingCaptionTextIfSuperseded {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($script:pendingCaptionText)) {
+        return
+    }
+
+    if (Test-PendingCaptionSupersededByLine -Pending $script:pendingCaptionText -Line $Line) {
+        Clear-PendingCaptionText
+    }
+}
+
 while ($true) {
     if (Test-Path -LiteralPath $stopRequestPath) {
         $finalText = Get-TranscriptText -Captured $capturedText -Pending $pendingCaptionText -IncludePending
@@ -987,7 +1033,9 @@ while ($true) {
             $windowMissingNoticeShown = $true
         }
 
-        if (-not $NoStartLiveCaptions -and ((Get-Date) - $lastLiveCaptionsStartAttempt).TotalSeconds -ge 5) {
+        if (-not $NoStartLiveCaptions -and
+            $null -eq (Get-Process -Name "LiveCaptions" -ErrorAction SilentlyContinue) -and
+            ((Get-Date) - $lastLiveCaptionsStartAttempt).TotalSeconds -ge 5) {
             Send-LiveCaptionsShortcut
             $lastLiveCaptionsStartAttempt = Get-Date
         }
@@ -1018,7 +1066,16 @@ while ($true) {
         $line = $snapshotLines[$lineIndex]
         $isLastSnapshotLine = ($lineIndex -eq ($snapshotLines.Count - 1))
 
-        if ($isLastSnapshotLine -and -not (Test-CompleteCaptionLine $line)) {
+        if (-not $isLastSnapshotLine) {
+            Clear-PendingCaptionTextIfSuperseded -Line $line
+
+            if (Add-CapturedCaptionLine -Line $line) {
+                $textChanged = $true
+            }
+            continue
+        }
+
+        if (-not (Test-CompleteCaptionLine $line)) {
             if (Set-PendingCaptionTextSafely -Text $line) {
                 $textChanged = $true
             }
